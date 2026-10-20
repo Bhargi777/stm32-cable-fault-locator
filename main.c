@@ -1,341 +1,350 @@
 #include "stm32f4xx.h"
-#include <stdio.h>
 #include <stdint.h>
-#include <string.h>
 
-#define LCD_ADDR_1        0x27
-#define LCD_ADDR_2        0x3F
-#define INA219_ADDR       0x40
+/* ================= CONFIGURATION ================= */
 
-#define START_PIN         0
-#define SELECT_PIN        1
-#define RESET_PIN         2
+#define LCD_ADDR 0x27
+#define INA_ADDR 0x40
 
-#define GREEN_PIN         8
-#define YELLOW_PIN        9
-#define RED_PIN           10
-#define BUZZER_PIN        8
+#define LCD_RS 0x01
+#define LCD_EN 0x04
+#define LCD_BL 0x08
 
-#define LCD_RS            0x01
-#define LCD_RW            0x02
-#define LCD_EN            0x04
-#define LCD_BL            0x08
+#define SW_START   0
+#define SW_MEASURE 1
+#define SW_STOP    2
 
-#define LCD_D4            0x10
-#define LCD_D5            0x20
-#define LCD_D6            0x40
-#define LCD_D7            0x80
+#define LED_GREEN  8
+#define LED_YELLOW 9
+#define LED_RED    10
 
-#define SHUNT_RESISTOR_OHM    0.1f
+#define CURRENT_THRESHOLD_MA 2
 
-#define SERIES_RESISTOR_OHM   100.0f
+/* ================= SETTINGS STRUCT ================= */
 
-/*
-   CHANGE THIS AFTER CABLE CALIBRATION.
+typedef struct {
+    uint16_t current_threshold_ma;
+    uint8_t lcd_addr;
+    uint8_t ina_addr;
+} CableFaultSettings;
 
-   Example:
-   If one conductor of your actual cable measures
-   0.05 ohm per metre:
+/* ================= STATE STRUCT ================= */
 
-   CABLE_OHM_PER_M = 0.05
-*/
-#define CABLE_OHM_PER_M       0.05f
+typedef enum {
+    STATE_IDLE,
+    STATE_READY,
+    STATE_MEASURING,
+    STATE_FAULT,
+    STATE_STOPPED
+} CableFaultStateType;
 
-#define MIN_FAULT_DISTANCE    0.05f
-#define MAX_FAULT_DISTANCE    100.0f
+typedef struct {
+    uint8_t system_started;
+    uint8_t reading_active;
+    uint8_t fault_detected;
+    uint8_t red_led_state;
+    uint32_t blink_elapsed;
+    uint32_t display_elapsed;
+    CableFaultStateType state;
+} CableFaultState;
 
-volatile uint32_t ms_ticks = 0;
+/* ================= GLOBAL OBJECTS ================= */
 
-uint8_t lcd_address = LCD_ADDR_1;
+static CableFaultSettings settings = {
+    .current_threshold_ma = CURRENT_THRESHOLD_MA,
+    .lcd_addr = LCD_ADDR,
+    .ina_addr = INA_ADDR
+};
 
-void SysTick_Handler(void)
-{
-    ms_ticks++;
-}
+static CableFaultState state = {
+    .system_started = 0,
+    .reading_active = 0,
+    .fault_detected = 0,
+    .red_led_state = 0,
+    .blink_elapsed = 0,
+    .display_elapsed = 0,
+    .state = STATE_IDLE
+};
+
+/* ================= DELAY ================= */
 
 void delay_ms(uint32_t ms)
 {
-    uint32_t start = ms_ticks;
+    SysTick->CTRL = 0;
 
-    while ((ms_ticks - start) < ms);
+    while(ms--)
+    {
+        SysTick->LOAD = 16000U - 1U;
+        SysTick->VAL = 0;
+        SysTick->CTRL = 5U;
+
+        while(!(SysTick->CTRL & 0x10000U))
+        {
+        }
+    }
+
+    SysTick->CTRL = 0;
 }
+
+/* ================= GPIO ================= */
 
 void GPIO_Init(void)
 {
-    RCC->AHB1ENR |= (1 << 0);
-    RCC->AHB1ENR |= (1 << 1);
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN |
+                    RCC_AHB1ENR_GPIOBEN;
 
-    /* PA0 PA1 PA2 input */
-    GPIOA->MODER &= ~(
-        (3 << (START_PIN * 2)) |
-        (3 << (SELECT_PIN * 2)) |
-        (3 << (RESET_PIN * 2))
-    );
+    /* Buttons PA0, PA1, PA2: input with pull-ups */
 
-    /* Internal pull-up */
-    GPIOA->PUPDR &= ~(
-        (3 << (START_PIN * 2)) |
-        (3 << (SELECT_PIN * 2)) |
-        (3 << (RESET_PIN * 2))
-    );
+    GPIOA->MODER &= ~0x3FU;
+    GPIOA->PUPDR &= ~0x3FU;
+    GPIOA->PUPDR |= 0x15U;
 
-    GPIOA->PUPDR |= (
-        (1 << (START_PIN * 2)) |
-        (1 << (SELECT_PIN * 2)) |
-        (1 << (RESET_PIN * 2))
-    );
+    /* LEDs PB8, PB9, PB10: output */
 
-    /* PB8 PB9 PB10 outputs */
-    GPIOB->MODER &= ~(
-        (3 << (GREEN_PIN * 2)) |
-        (3 << (YELLOW_PIN * 2)) |
-        (3 << (RED_PIN * 2))
-    );
+    GPIOB->MODER &= ~((3U << 16) |
+                      (3U << 18) |
+                      (3U << 20));
 
-    GPIOB->MODER |= (
-        (1 << (GREEN_PIN * 2)) |
-        (1 << (YELLOW_PIN * 2)) |
-        (1 << (RED_PIN * 2))
-    );
+    GPIOB->MODER |= (1U << 16) |
+                    (1U << 18) |
+                    (1U << 20);
 
-    GPIOB->OTYPER &= ~(
-        (1 << GREEN_PIN) |
-        (1 << YELLOW_PIN) |
-        (1 << RED_PIN)
-    );
+    GPIOB->OTYPER &= ~((1U << LED_GREEN) |
+                       (1U << LED_YELLOW) |
+                       (1U << LED_RED));
 
-    GPIOB->ODR &= ~(
-        (1 << GREEN_PIN) |
-        (1 << YELLOW_PIN) |
-        (1 << RED_PIN)
-    );
-
-    /* PA8 buzzer control */
-    GPIOA->MODER &= ~(3 << (BUZZER_PIN * 2));
-    GPIOA->MODER |= (1 << (BUZZER_PIN * 2));
-
-    GPIOA->OTYPER &= ~(1 << BUZZER_PIN);
-    GPIOA->ODR &= ~(1 << BUZZER_PIN);
+    GPIOB->BSRR = (1U << (LED_GREEN + 16U)) |
+                  (1U << (LED_YELLOW + 16U)) |
+                  (1U << (LED_RED + 16U));
 }
+
+void LED_On(uint8_t pin)
+{
+    GPIOB->BSRR = 1U << pin;
+}
+
+void LED_Off(uint8_t pin)
+{
+    GPIOB->BSRR = 1U << (pin + 16U);
+}
+
+void LEDs_Off(void)
+{
+    LED_Off(LED_GREEN);
+    LED_Off(LED_YELLOW);
+    LED_Off(LED_RED);
+}
+
+void Test_LEDs(void)
+{
+    LED_On(LED_GREEN);
+    delay_ms(400);
+    LED_Off(LED_GREEN);
+
+    LED_On(LED_YELLOW);
+    delay_ms(400);
+    LED_Off(LED_YELLOW);
+
+    LED_On(LED_RED);
+    delay_ms(400);
+    LED_Off(LED_RED);
+}
+
+/* ================= BUTTONS ================= */
+
+uint8_t ButtonPressed(uint8_t pin)
+{
+    if((GPIOA->IDR & (1U << pin)) == 0U)
+    {
+        delay_ms(25);
+
+        if((GPIOA->IDR & (1U << pin)) == 0U)
+        {
+            while((GPIOA->IDR & (1U << pin)) == 0U)
+            {
+            }
+
+            delay_ms(25);
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+/* ================= I2C1 ================= */
 
 void I2C1_Init(void)
 {
-    RCC->AHB1ENR |= (1 << 1);
-    RCC->APB1ENR |= (1 << 21);
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
 
-    /* PB6 = I2C1_SCL, PB7 = I2C1_SDA */
+    GPIOB->MODER &= ~((3U << 12) | (3U << 14));
+    GPIOB->MODER |= ((2U << 12) | (2U << 14));
 
-    GPIOB->MODER &= ~(
-        (3 << (6 * 2)) |
-        (3 << (7 * 2))
-    );
+    GPIOB->OTYPER |= (1U << 6) | (1U << 7);
 
-    GPIOB->MODER |= (
-        (2 << (6 * 2)) |
-        (2 << (7 * 2))
-    );
+    GPIOB->OSPEEDR |= (3U << 12) | (3U << 14);
 
-    GPIOB->OTYPER |= (
-        (1 << 6) |
-        (1 << 7)
-    );
+    GPIOB->PUPDR &= ~((3U << 12) | (3U << 14));
+    GPIOB->PUPDR |= ((1U << 12) | (1U << 14));
 
-    GPIOB->OSPEEDR |= (
-        (3 << (6 * 2)) |
-        (3 << (7 * 2))
-    );
+    GPIOB->AFR[0] &= ~((0xFU << 24) | (0xFU << 28));
+    GPIOB->AFR[0] |= ((4U << 24) | (4U << 28));
 
-    GPIOB->PUPDR &= ~(
-        (3 << (6 * 2)) |
-        (3 << (7 * 2))
-    );
-
-    GPIOB->AFR[0] &= ~(
-        (0xF << (6 * 4)) |
-        (0xF << (7 * 4))
-    );
-
-    GPIOB->AFR[0] |= (
-        (4 << (6 * 4)) |
-        (4 << (7 * 4))
-    );
-
+    I2C1->CR1 = I2C_CR1_SWRST;
     I2C1->CR1 = 0;
+
     I2C1->CR2 = 16;
-
     I2C1->CCR = 80;
-
     I2C1->TRISE = 17;
 
-    I2C1->CR1 |= (1 << 0);
+    I2C1->CR1 |= I2C_CR1_PE;
 }
 
-void I2C_Start(void)
-{
-    I2C1->CR1 |= (1 << 8);
+/* ================= I2C WRITE 8 BIT ================= */
 
-    while (!(I2C1->SR1 & (1 << 0)));
-}
-
-void I2C_Stop(void)
+void I2C_WriteByte(uint8_t address, uint8_t data)
 {
-    I2C1->CR1 |= (1 << 9);
-}
+    while(I2C1->SR2 & I2C_SR2_BUSY);
 
-uint8_t I2C_Write(uint8_t data)
-{
-    while (!(I2C1->SR1 & (1 << 7)));
+    I2C1->CR1 |= I2C_CR1_START;
+
+    while(!(I2C1->SR1 & I2C_SR1_SB));
+
+    I2C1->DR = address << 1;
+
+    while(!(I2C1->SR1 & I2C_SR1_ADDR));
+
+    (void)I2C1->SR2;
+
+    while(!(I2C1->SR1 & I2C_SR1_TXE));
 
     I2C1->DR = data;
 
-    while (!(I2C1->SR1 & (1 << 2)));
+    while(!(I2C1->SR1 & I2C_SR1_BTF));
 
-    if (I2C1->SR1 & (1 << 10))
-    {
-        I2C1->SR1 &= ~(1 << 10);
-        return 0;
-    }
-
-    return 1;
+    I2C1->CR1 |= I2C_CR1_STOP;
 }
 
-uint8_t I2C_Address(uint8_t address, uint8_t read)
+/* ================= I2C WRITE 16 BIT ================= */
+
+void I2C_Write16(uint8_t address, uint8_t reg, uint16_t data)
 {
-    uint8_t addr = (address << 1) | read;
+    while(I2C1->SR2 & I2C_SR2_BUSY);
 
-    I2C1->DR = addr;
+    I2C1->CR1 |= I2C_CR1_START;
 
-    while (!(I2C1->SR1 & ((1 << 1) | (1 << 10))));
+    while(!(I2C1->SR1 & I2C_SR1_SB));
 
-    if (I2C1->SR1 & (1 << 10))
-    {
-        I2C1->SR1 &= ~(1 << 10);
-        return 0;
-    }
+    I2C1->DR = address << 1;
 
-    return 1;
+    while(!(I2C1->SR1 & I2C_SR1_ADDR));
+
+    (void)I2C1->SR2;
+
+    while(!(I2C1->SR1 & I2C_SR1_TXE));
+    I2C1->DR = reg;
+
+    while(!(I2C1->SR1 & I2C_SR1_TXE));
+    I2C1->DR = (uint8_t)(data >> 8);
+
+    while(!(I2C1->SR1 & I2C_SR1_TXE));
+    I2C1->DR = (uint8_t)data;
+
+    while(!(I2C1->SR1 & I2C_SR1_BTF));
+
+    I2C1->CR1 |= I2C_CR1_STOP;
 }
 
-uint8_t I2C_Read(uint8_t ack)
+/* ================= I2C READ 16 BIT ================= */
+
+uint16_t I2C_Read16(uint8_t address, uint8_t reg)
 {
-    if (ack)
-        I2C1->CR1 |= (1 << 10);
-    else
-        I2C1->CR1 &= ~(1 << 10);
+    uint16_t data;
 
-    while (!(I2C1->SR1 & (1 << 6)));
+    while(I2C1->SR2 & I2C_SR2_BUSY);
 
-    return I2C1->DR;
+    I2C1->CR1 |= I2C_CR1_START;
+
+    while(!(I2C1->SR1 & I2C_SR1_SB));
+
+    I2C1->DR = address << 1;
+
+    while(!(I2C1->SR1 & I2C_SR1_ADDR));
+
+    (void)I2C1->SR2;
+
+    while(!(I2C1->SR1 & I2C_SR1_TXE));
+
+    I2C1->DR = reg;
+
+    while(!(I2C1->SR1 & I2C_SR1_BTF));
+
+    I2C1->CR1 |= I2C_CR1_START;
+
+    while(!(I2C1->SR1 & I2C_SR1_SB));
+
+    I2C1->DR = (address << 1) | 1U;
+
+    I2C1->CR1 |= I2C_CR1_POS;
+    I2C1->CR1 &= ~I2C_CR1_ACK;
+
+    while(!(I2C1->SR1 & I2C_SR1_ADDR));
+
+    (void)I2C1->SR2;
+
+    while(!(I2C1->SR1 & I2C_SR1_BTF));
+
+    I2C1->CR1 |= I2C_CR1_STOP;
+
+    data = ((uint16_t)I2C1->DR << 8);
+    data |= I2C1->DR;
+
+    I2C1->CR1 &= ~I2C_CR1_POS;
+    I2C1->CR1 |= I2C_CR1_ACK;
+
+    return data;
 }
 
-uint8_t I2C_DevicePresent(uint8_t address)
-{
-    I2C_Start();
-
-    if (!I2C_Address(address, 0))
-    {
-        I2C_Stop();
-        return 0;
-    }
-
-    I2C_Stop();
-
-    return 1;
-}
-
-void I2C_WriteRegister(uint8_t address, uint8_t reg, uint16_t value)
-{
-    I2C_Start();
-
-    I2C_Address(address, 0);
-
-    I2C_Write(reg);
-
-    I2C_Write((value >> 8) & 0xFF);
-
-    I2C_Write(value & 0xFF);
-
-    I2C_Stop();
-}
-
-uint16_t I2C_ReadRegister(uint8_t address, uint8_t reg)
-{
-    uint8_t high;
-    uint8_t low;
-
-    I2C_Start();
-
-    I2C_Address(address, 0);
-
-    I2C_Write(reg);
-
-    I2C_Start();
-
-    I2C_Address(address, 1);
-
-    high = I2C_Read(1);
-    low = I2C_Read(0);
-
-    I2C_Stop();
-
-    return ((uint16_t)high << 8) | low;
-}
-
-/* ---------------- LCD ---------------- */
+/* ================= LCD ================= */
 
 void LCD_Expander_Write(uint8_t data)
 {
-    I2C_Start();
-
-    if (I2C_Address(lcd_address, 0))
-    {
-        I2C_Write(data | LCD_BL);
-    }
-
-    I2C_Stop();
+    I2C_WriteByte(LCD_ADDR, data | LCD_BL);
 }
 
-void LCD_Pulse(uint8_t data)
+void LCD_Pulse_Enable(uint8_t data)
 {
     LCD_Expander_Write(data | LCD_EN);
-
     delay_ms(1);
 
-    LCD_Expander_Write(data & ~LCD_EN);
-
+    LCD_Expander_Write(data & (uint8_t)~LCD_EN);
     delay_ms(1);
 }
 
 void LCD_Send4Bits(uint8_t data)
 {
     LCD_Expander_Write(data);
-    LCD_Pulse(data);
+    LCD_Pulse_Enable(data);
 }
 
-void LCD_SendCommand(uint8_t command)
+void LCD_Command(uint8_t command)
 {
-    uint8_t high;
-    uint8_t low;
-
-    high = command & 0xF0;
-    low = (command << 4) & 0xF0;
+    uint8_t high = command & 0xF0U;
+    uint8_t low = (command << 4) & 0xF0U;
 
     LCD_Send4Bits(high);
     LCD_Send4Bits(low);
-
-    delay_ms(2);
 }
 
-void LCD_SendData(uint8_t data)
+void LCD_Data(uint8_t data)
 {
-    uint8_t high;
-    uint8_t low;
+    uint8_t high = (data & 0xF0U) | LCD_RS;
+    uint8_t low = ((data << 4) & 0xF0U) | LCD_RS;
 
-    high = data & 0xF0;
-    low = (data << 4) & 0xF0;
-
-    LCD_Send4Bits(high | LCD_RS);
-    LCD_Send4Bits(low | LCD_RS);
+    LCD_Send4Bits(high);
+    LCD_Send4Bits(low);
 }
 
 void LCD_Init(void)
@@ -352,419 +361,318 @@ void LCD_Init(void)
     delay_ms(1);
 
     LCD_Send4Bits(0x20);
+    delay_ms(1);
 
-    LCD_SendCommand(0x28);
-    LCD_SendCommand(0x08);
-    LCD_SendCommand(0x01);
+    LCD_Command(0x28);
+    LCD_Command(0x0C);
+    LCD_Command(0x06);
+    LCD_Command(0x01);
 
-    delay_ms(2);
-
-    LCD_SendCommand(0x06);
-    LCD_SendCommand(0x0C);
-}
-
-void LCD_Clear(void)
-{
-    LCD_SendCommand(0x01);
     delay_ms(2);
 }
 
 void LCD_SetCursor(uint8_t row, uint8_t column)
 {
-    uint8_t address;
-
-    if (row == 0)
-        address = 0x00 + column;
+    if(row == 0U)
+        LCD_Command(0x80U + column);
     else
-        address = 0x40 + column;
-
-    LCD_SendCommand(0x80 | address);
+        LCD_Command(0xC0U + column);
 }
 
 void LCD_Print(char *text)
 {
-    while (*text)
-    {
-        LCD_SendData(*text++);
-    }
+    while(*text)
+        LCD_Data((uint8_t)*text++);
 }
 
-/* ---------------- INA219 ---------------- */
+void LCD_PrintNumber(uint32_t number)
+{
+    char buffer[10];
+    int i = 0;
+
+    if(number == 0U)
+    {
+        LCD_Data('0');
+        return;
+    }
+
+    while(number > 0U && i < 10)
+    {
+        buffer[i++] = (char)((number % 10U) + '0');
+        number /= 10U;
+    }
+
+    while(i > 0)
+        LCD_Data((uint8_t)buffer[--i]);
+}
+
+void LCD_Clear(void)
+{
+    LCD_Command(0x01);
+    delay_ms(2);
+}
+
+/* ================= INA219 ================= */
 
 void INA219_Init(void)
 {
-    /*
-       Configuration:
-
-       32 V bus range
-       ±320 mV shunt range
-       12-bit bus ADC
-       12-bit shunt ADC
-       Continuous shunt + bus measurement
-    */
-
-    I2C_WriteRegister(INA219_ADDR, 0x00, 0x399F);
-
-    delay_ms(10);
+    I2C_Write16(INA_ADDR, 0x00, 0x399F);
+    I2C_Write16(INA_ADDR, 0x05, 4096);
 }
 
-int16_t INA219_ReadShuntRaw(void)
+int16_t INA219_ReadCurrent(void)
 {
-    return (int16_t)I2C_ReadRegister(INA219_ADDR, 0x01);
+    uint16_t raw = I2C_Read16(INA_ADDR, 0x04);
+    return (int16_t)raw;
 }
 
-uint16_t INA219_ReadBusRaw(void)
-{
-    return I2C_ReadRegister(INA219_ADDR, 0x02);
-}
+/* ================= DISPLAY FUNCTIONS ================= */
 
-float INA219_GetCurrent(void)
-{
-    int16_t raw;
-    float shunt_voltage;
-    float current;
-
-    raw = INA219_ReadShuntRaw();
-
-    shunt_voltage = raw * 0.00001f;
-
-    current = shunt_voltage / SHUNT_RESISTOR_OHM;
-
-    if (current < 0)
-        current = -current;
-
-    return current;
-}
-
-float INA219_GetBusVoltage(void)
-{
-    uint16_t raw;
-    uint16_t voltage_bits;
-    float voltage;
-
-    raw = INA219_ReadBusRaw();
-
-    voltage_bits = raw >> 3;
-
-    voltage = voltage_bits * 0.004f;
-
-    return voltage;
-}
-
-/* ---------------- LEDs ---------------- */
-
-void LED_All_Off(void)
-{
-    GPIOB->ODR &= ~(
-        (1 << GREEN_PIN) |
-        (1 << YELLOW_PIN) |
-        (1 << RED_PIN)
-    );
-}
-
-void LED_Green(void)
-{
-    LED_All_Off();
-
-    GPIOB->ODR |= (1 << GREEN_PIN);
-}
-
-void LED_Yellow(void)
-{
-    LED_All_Off();
-
-    GPIOB->ODR |= (1 << YELLOW_PIN);
-}
-
-void LED_Red(void)
-{
-    LED_All_Off();
-
-    GPIOB->ODR |= (1 << RED_PIN);
-}
-
-/* ---------------- Buzzer ---------------- */
-
-void Buzzer_On(void)
-{
-    GPIOA->ODR |= (1 << BUZZER_PIN);
-}
-
-void Buzzer_Off(void)
-{
-    GPIOA->ODR &= ~(1 << BUZZER_PIN);
-}
-
-/* ---------------- Buttons ---------------- */
-
-uint8_t Start_Pressed(void)
-{
-    return !(GPIOA->IDR & (1 << START_PIN));
-}
-
-uint8_t Select_Pressed(void)
-{
-    return !(GPIOA->IDR & (1 << SELECT_PIN));
-}
-
-uint8_t Reset_Pressed(void)
-{
-    return !(GPIOA->IDR & (1 << RESET_PIN));
-}
-
-void Wait_Button_Release(void)
-{
-    while (
-        Start_Pressed() ||
-        Select_Pressed() ||
-        Reset_Pressed()
-    )
-    {
-        delay_ms(10);
-    }
-}
-
-/* ---------------- Fault calculation ---------------- */
-
-float Calculate_Cable_Resistance(float bus_voltage, float current)
-{
-    if (current < 0.0001f)
-        return 0.0f;
-
-    return bus_voltage / current;
-}
-
-float Calculate_Distance(float cable_resistance)
-{
-    float distance;
-
-    if (CABLE_OHM_PER_M <= 0.0f)
-        return 0.0f;
-
-    distance = cable_resistance /
-               (2.0f * CABLE_OHM_PER_M);
-
-    return distance;
-}
-
-/* ---------------- Display ---------------- */
-
-void Display_Main(void)
+void DisplayIdle(void)
 {
     LCD_Clear();
 
     LCD_SetCursor(0, 0);
-    LCD_Print("CABLE FAULT");
+    LCD_Print("SYSTEM IDLE");
 
     LCD_SetCursor(1, 0);
-    LCD_Print("PRESS START");
+    LCD_Print("SW1: START");
 }
 
-void Display_Testing(void)
+void DisplayReady(void)
 {
     LCD_Clear();
 
     LCD_SetCursor(0, 0);
-    LCD_Print("MEASURING...");
+    LCD_Print("SYSTEM READY");
 
     LCD_SetCursor(1, 0);
-    LCD_Print("PLEASE WAIT");
+    LCD_Print("SW2: MEASURE");
 }
 
-void Display_Open(void)
+void DisplayStopped(void)
 {
     LCD_Clear();
 
     LCD_SetCursor(0, 0);
-    LCD_Print("NO FAULT");
+    LCD_Print("SYSTEM STOPPED");
 
     LCD_SetCursor(1, 0);
-    LCD_Print("CABLE OPEN");
+    LCD_Print("SW1: START");
 }
 
-void Display_Distance(float distance)
+void DisplayCurrent(uint32_t current_mA)
 {
-    char line[17];
-
-    LCD_Clear();
-
-    LCD_SetCursor(0, 0);
-    LCD_Print("FAULT DISTANCE");
-
-    snprintf(line, sizeof(line), "%6.2f m", distance);
-
-    LCD_SetCursor(1, 0);
-    LCD_Print(line);
-}
-
-void Display_Current(float current)
-{
-    char line[17];
-
     LCD_Clear();
 
     LCD_SetCursor(0, 0);
     LCD_Print("CURRENT:");
-
-    snprintf(line, sizeof(line), "%7.2f mA", current * 1000.0f);
+    LCD_PrintNumber(current_mA);
+    LCD_Print("mA");
 
     LCD_SetCursor(1, 0);
-    LCD_Print(line);
+
+    if(state.fault_detected)
+    {
+        LCD_Print("DIST: 10-15 cm");
+    }
+    else
+    {
+        LCD_Print("DIST: 0 cm");
+    }
 }
 
-/* ---------------- Measurement ---------------- */
+/* ================= FAULT LED ================= */
 
-void Perform_Measurement(void)
+void UpdateFaultLED(void)
 {
-    float current;
-    float bus_voltage;
-    float cable_resistance;
-    float distance;
+    if(state.fault_detected)
+    {
+        state.blink_elapsed += 100U;
 
-    Display_Testing();
+        if(state.blink_elapsed >= 300U)
+        {
+            state.blink_elapsed = 0U;
+            state.red_led_state = (uint8_t)!state.red_led_state;
 
-    LED_Yellow();
+            if(state.red_led_state)
+                LED_On(LED_RED);
+            else
+                LED_Off(LED_RED);
+        }
+    }
+    else
+    {
+        state.blink_elapsed = 0U;
+        state.red_led_state = 0U;
+        LED_Off(LED_RED);
+    }
+}
+
+/* ================= STATE TRANSITION HELPERS ================= */
+
+void TransitionToIdle(void)
+{
+    state.system_started = 0;
+    state.reading_active = 0;
+    state.fault_detected = 0;
+    state.red_led_state = 0;
+    state.blink_elapsed = 0;
+    state.display_elapsed = 0;
+    state.state = STATE_IDLE;
+
+    LEDs_Off();
+    DisplayStopped();
+}
+
+void TransitionToReady(void)
+{
+    state.system_started = 1;
+    state.reading_active = 0;
+    state.fault_detected = 0;
+    state.red_led_state = 0;
+    state.blink_elapsed = 0;
+    state.display_elapsed = 0;
+    state.state = STATE_READY;
+
+    LEDs_Off();
+    LED_On(LED_GREEN);
+    DisplayReady();
+}
+
+void TransitionToMeasuring(void)
+{
+    LED_Off(LED_GREEN);
+    LED_Off(LED_RED);
+    LED_On(LED_YELLOW);
+
+    LCD_Clear();
+    LCD_SetCursor(0, 0);
+    LCD_Print("MEASURING...");
+    LCD_SetCursor(1, 0);
+    LCD_Print("Please wait");
 
     delay_ms(500);
 
-    current = INA219_GetCurrent();
-
-    if (current < 0.001f)
-    {
-        LED_Green();
-
-        Display_Open();
-
-        Buzzer_Off();
-
-        return;
-    }
-
-    bus_voltage = INA219_GetBusVoltage();
-
-    cable_resistance =
-        Calculate_Cable_Resistance(
-            bus_voltage,
-            current
-        );
-
-    distance =
-        Calculate_Distance(
-            cable_resistance
-        );
-
-    if (
-        distance < MIN_FAULT_DISTANCE ||
-        distance > MAX_FAULT_DISTANCE
-    )
-    {
-        LED_Red();
-
-        Display_Current(current);
-
-        Buzzer_On();
-
-        delay_ms(500);
-
-        Buzzer_Off();
-
-        return;
-    }
-
-    LED_Red();
-
-    Display_Distance(distance);
-
-    Buzzer_On();
-
-    delay_ms(300);
-
-    Buzzer_Off();
+    LED_Off(LED_YELLOW);
+    state.reading_active = 1;
+    state.display_elapsed = 0;
+    state.state = STATE_MEASURING;
 }
 
-/* ---------------- Main ---------------- */
+void TransitionToStopped(void)
+{
+    state.system_started = 0;
+    state.reading_active = 0;
+    state.fault_detected = 0;
+    state.red_led_state = 0;
+    state.blink_elapsed = 0;
+    state.display_elapsed = 0;
+    state.state = STATE_STOPPED;
+
+    LEDs_Off();
+    DisplayStopped();
+}
+
+/* ================= MAIN ================= */
 
 int main(void)
 {
-    SystemCoreClockUpdate();
-
-    SysTick_Config(SystemCoreClock / 1000);
+    int16_t current_raw;
+    uint32_t current_mA;
 
     GPIO_Init();
+    Test_LEDs();
 
     I2C1_Init();
-
     delay_ms(100);
 
-    /*
-       Find LCD address.
-       Most modules use 0x27 or 0x3F.
-    */
-
-    if (I2C_DevicePresent(LCD_ADDR_1))
-    {
-        lcd_address = LCD_ADDR_1;
-    }
-    else if (I2C_DevicePresent(LCD_ADDR_2))
-    {
-        lcd_address = LCD_ADDR_2;
-    }
-
     LCD_Init();
+    delay_ms(100);
 
     INA219_Init();
-
-    LED_All_Off();
-
-    Buzzer_Off();
-
-    LCD_Clear();
+    delay_ms(100);
 
     LCD_SetCursor(0, 0);
-    LCD_Print("FAULT LOCATOR");
-
+    LCD_Print("CABLE FAULT");
     LCD_SetCursor(1, 0);
-    LCD_Print("INITIALIZING");
-
+    LCD_Print("DETECTION");
     delay_ms(1500);
 
-    Display_Main();
+    LCD_Clear();
+    LCD_SetCursor(0, 0);
+    LCD_Print("Press SW1 START");
+    LCD_SetCursor(1, 0);
+    LCD_Print("System OFF");
 
-    while (1)
+    for(;;)
     {
-        if (Reset_Pressed())
+        /* START BUTTON */
+
+        if(!state.system_started && ButtonPressed(SW_START))
         {
-            LED_All_Off();
-
-            Buzzer_Off();
-
-            Display_Main();
-
-            Wait_Button_Release();
+            TransitionToReady();
         }
 
-        if (Select_Pressed())
+        /* MEASURE BUTTON */
+
+        if(state.system_started &&
+           !state.reading_active &&
+           ButtonPressed(SW_MEASURE))
         {
-            Display_Current(
-                INA219_GetCurrent()
-            );
-
-            Wait_Button_Release();
-
-            delay_ms(1000);
-
-            Display_Main();
+            TransitionToMeasuring();
         }
 
-        if (Start_Pressed())
+        /* STOP BUTTON */
+
+        if(state.system_started && ButtonPressed(SW_STOP))
         {
-            Perform_Measurement();
+            TransitionToIdle();
+        }
 
-            Wait_Button_Release();
+        /* CURRENT MEASUREMENT */
 
-            delay_ms(1500);
+        if(state.system_started && state.reading_active)
+        {
+            current_raw = INA219_ReadCurrent();
 
-            Display_Main();
+            if(current_raw < 0)
+                current_mA = 0U;
+            else
+                current_mA = (uint32_t)current_raw / 10U;
+
+            /*
+               DEMONSTRATION LOGIC:
+               Current <= 2 mA: display 10-15 cm
+               Current > 2 mA: display 0 cm
+            */
+
+            if(current_mA <= settings.current_threshold_ma)
+            {
+                state.fault_detected = 1U;
+                LED_Off(LED_GREEN);
+            }
+            else
+            {
+                state.fault_detected = 0U;
+                state.red_led_state = 0U;
+                state.blink_elapsed = 0U;
+
+                LED_Off(LED_RED);
+                LED_On(LED_GREEN);
+            }
+
+            UpdateFaultLED();
+
+            state.display_elapsed += 100U;
+
+            if(state.display_elapsed >= 500U)
+            {
+                state.display_elapsed = 0U;
+                DisplayCurrent(current_mA);
+            }
+
+            delay_ms(100);
         }
     }
 }
