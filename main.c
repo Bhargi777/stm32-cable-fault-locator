@@ -20,7 +20,17 @@
 
 #define CURRENT_THRESHOLD_MA 2
 
-/* ================= SETTINGS STRUCT ================= */
+
+
+
+/* ================= Note =================
+ * Fault distance calculation requires cable parameters:
+ * - Cable length, material, cross-section, insulation type
+ * - Or TDR (Time Domain Reflectometry) equipment
+ * This system detects fault presence, not exact location.
+ * For exact fault location, professional fault locators
+ * with TDR capability are required.
+ * ================= SETTINGS STRUCT ================= */
 
 typedef struct {
     uint16_t current_threshold_ma;
@@ -51,19 +61,13 @@ typedef struct {
 /* ================= GLOBAL OBJECTS ================= */
 
 static CableFaultSettings settings = {
-    .current_threshold_ma = CURRENT_THRESHOLD_MA,
-    .lcd_addr = LCD_ADDR,
-    .ina_addr = INA_ADDR
+    CURRENT_THRESHOLD_MA,
+    LCD_ADDR,
+    INA_ADDR
 };
 
 static CableFaultState state = {
-    .system_started = 0,
-    .reading_active = 0,
-    .fault_detected = 0,
-    .red_led_state = 0,
-    .blink_elapsed = 0,
-    .display_elapsed = 0,
-    .state = STATE_IDLE
+    0, 0, 0, 0, 0, 0, STATE_IDLE
 };
 
 /* ================= DELAY ================= */
@@ -474,11 +478,22 @@ void DisplayCurrent(uint32_t current_mA)
 
     if(state.fault_detected)
     {
-        LCD_Print("DIST: 10-15 cm");
+        /* Estimate distance: linearly from MAX_DISTANCE_CM at 0mA to 0cm at threshold */
+        uint16_t distance_cm = (uint16_t)(
+            (15U * (settings.current_threshold_ma - current_mA)) /
+            settings.current_threshold_ma
+        );
+
+        LCD_Print("DIST: ");
+        LCD_PrintNumber(distance_cm);
+        LCD_Print(" cm");
+
+        LED_Off(LED_GREEN);
     }
     else
     {
-        LCD_Print("DIST: 0 cm");
+        LCD_Print("NO FAULT      ");
+        LED_On(LED_GREEN);
     }
 }
 
@@ -642,9 +657,9 @@ int main(void)
                 current_mA = (uint32_t)current_raw / 10U;
 
             /*
-               DEMONSTRATION LOGIC:
-               Current <= 2 mA: display 10-15 cm
-               Current > 2 mA: display 0 cm
+               FAULT DETECTION:
+               Current <= threshold: fault detected
+               Current > threshold: no fault
             */
 
             if(current_mA <= settings.current_threshold_ma)
